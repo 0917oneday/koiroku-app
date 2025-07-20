@@ -1,1 +1,692 @@
 # koiroku-app
+
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged
+} from 'firebase/auth';
+import {
+  getFirestore,
+  collection,
+  addDoc,
+  onSnapshot,
+  query,
+  doc,
+  updateDoc,
+  deleteDoc,
+  serverTimestamp,
+  getDocs,
+  where // For finding public document to delete
+} from 'firebase/firestore';
+
+// Canvas環境から提供されるグローバル変数
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+function App() {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [user, setUser] = useState(null); // FirebaseのUserオブジェクト
+  const [isLoading, setIsLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('myRecords'); // 'myRecords' または 'allRecords'
+
+  // 認証関連のステート
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+
+  // 日記関連のステート
+  const [newTitle, setNewTitle] = useState('');
+  const [newContent, setNewContent] = useState('');
+  const [isPublic, setIsPublic] = useState(false); // 公開設定
+  const [editingDiary, setEditingDiary] = useState(null);
+  const [myDiaries, setMyDiaries] = useState([]); // 自分の恋録
+  const [allDiaries, setAllDiaries] = useState([]); // みんなの恋録
+
+  // カスタムモーダル関連のステート
+  const [showModal, setShowModal] = useState(false);
+  const [modalMessage, setModalMessage] = useState('');
+  const [modalAction, setModalAction] = useState(null); // 確認アクション用
+
+  // Gemini API関連のステート
+  const [generatingWordsForDiaryId, setGeneratingWordsForDiaryId] = useState(null); // LLM処理中の日記ID
+  const [generatedWords, setGeneratedWords] = useState(''); // LLMが生成した言葉
+
+  // Firebaseの初期化と認証状態の監視
+  useEffect(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      // 認証状態の変更をリッスン
+      const unsubscribe = onAuthStateChanged(firebaseAuth, (currentUser) => {
+        setUser(currentUser);
+        setIsLoading(false); // 認証状態が確定したらローディングを終了
+      });
+
+      return () => unsubscribe(); // クリーンアップ関数
+    } catch (error) {
+      console.error("Firebaseの初期化に失敗しました:", error);
+      setIsLoading(false);
+      showCustomModal('エラー: アプリの初期化に失敗しました。');
+    }
+  }, []);
+
+  // 自分の恋録データをリアルタイムで取得
+  useEffect(() => {
+    if (db && user) {
+      const myDiariesCollectionRef = collection(db, `artifacts/${appId}/users/${user.uid}/myLoveRecords`);
+      const q = query(myDiariesCollectionRef); // FirestoreのorderByはインデックスが必要なため、JSでソート
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedDiaries = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        // 作成日時でソート（新しいものが上に来るように）
+        fetchedDiaries.sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
+        setMyDiaries(fetchedDiaries);
+      }, (error) => {
+        console.error("自分の恋録データの取得に失敗しました:", error);
+        showCustomModal('エラー: 自分の恋録データの読み込みに失敗しました。');
+      });
+
+      return () => unsubscribe(); // クリーンアップ
+    } else {
+      setMyDiaries([]); // ログアウト時は自分の日記をクリア
+    }
+  }, [db, user]);
+
+  // みんなの恋録データをリアルタイムで取得
+  useEffect(() => {
+    if (db && user) { // 認証済みユーザーのみが閲覧可能
+      const allDiariesCollectionRef = collection(db, `artifacts/${appId}/public/data/allLoveRecords`);
+      const q = query(allDiariesCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedDiaries = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        // 作成日時でソート（新しいものが上に来るように）
+        fetchedDiaries.sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
+        setAllDiaries(fetchedDiaries);
+      }, (error) => {
+        console.error("みんなの恋録データの取得に失敗しました:", error);
+        showCustomModal('エラー: みんなの恋録データの読み込みに失敗しました。');
+      });
+
+      return () => unsubscribe(); // クリーンアップ
+    } else {
+      setAllDiaries([]); // ログアウト時はみんなの日記をクリア
+    }
+  }, [db, user]); // userに依存して、認証状態が準備できてからフェッチ
+
+  // カスタムモーダル表示関数
+  const showCustomModal = (message, action = null) => {
+    setModalMessage(message);
+    setModalAction(action);
+    setShowModal(true);
+  };
+
+  // カスタムモーダルを閉じる関数
+  const closeCustomModal = () => {
+    setShowModal(false);
+    setModalMessage('');
+    setModalAction(null);
+    setGeneratedWords(''); // 生成された言葉もクリア
+  };
+
+  // --- 認証ハンドラー ---
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (!auth) return;
+    try {
+      await createUserWithEmailAndPassword(auth, email, password);
+      showCustomModal('アカウントの登録が完了しました！');
+      setEmail('');
+      setPassword('');
+    } catch (error) {
+      console.error("登録エラー:", error);
+      setAuthError(error.message);
+      showCustomModal(`登録に失敗しました: ${error.message}`);
+    }
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (!auth) return;
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      showCustomModal('ログインしました！');
+      setEmail('');
+      setPassword('');
+    } catch (error) {
+      console.error("ログインエラー:", error);
+      setAuthError(error.message);
+      showCustomModal(`ログインに失敗しました: ${error.message}`);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!auth) return;
+    try {
+      await signOut(auth);
+      showCustomModal('ログアウトしました。');
+      setActiveTab('myRecords'); // ログアウト時にタブをリセット
+    } catch (error) {
+      console.error("ログアウトエラー:", error);
+      showCustomModal(`ログアウトに失敗しました: ${error.message}`);
+    }
+  };
+
+  // --- 恋録ハンドラー ---
+  const handleSubmitDiary = async (e) => {
+    e.preventDefault();
+    if (!newTitle.trim() || !newContent.trim()) {
+      showCustomModal('タイトルと内容を入力してください。');
+      return;
+    }
+    if (!db || !user) {
+      showCustomModal('ログインしてください。');
+      return;
+    }
+
+    try {
+      const myDiaryData = {
+        title: newTitle,
+        content: newContent,
+        isPublic: isPublic, // 公開ステータスをプライベートレコードに保存
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        authorEmail: user.email // 作者のメールアドレスを保存
+      };
+
+      if (editingDiary) {
+        // 既存の恋録を更新
+        const myDiaryRef = doc(db, `artifacts/${appId}/users/${user.uid}/myLoveRecords`, editingDiary.id);
+        await updateDoc(myDiaryRef, myDiaryData);
+
+        // 公開されていた、または今回公開する設定の場合、公開コレクションも更新/追加
+        if (editingDiary.isPublic || isPublic) {
+          // publicIdがあればそれを使用、なければoriginalDiaryIdとoriginalUserIdで検索
+          const publicDocId = editingDiary.publicId || await findPublicDocId(editingDiary.id, user.uid);
+          if (publicDocId) {
+            const publicDiaryRef = doc(db, `artifacts/${appId}/public/data/allLoveRecords`, publicDocId);
+            await updateDoc(publicDiaryRef, {
+              title: newTitle,
+              content: newContent,
+              updatedAt: serverTimestamp(),
+              authorEmail: user.email,
+              originalUserId: user.uid,
+              originalDiaryId: editingDiary.id
+            });
+          } else if (isPublic) { // 以前は非公開だったが、今回公開する場合
+             const publicDiariesCollectionRef = collection(db, `artifacts/${appId}/public/data/allLoveRecords`);
+             await addDoc(publicDiariesCollectionRef, {
+                title: newTitle,
+                content: newContent,
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                authorEmail: user.email,
+                originalUserId: user.uid,
+                originalDiaryId: editingDiary.id
+             });
+          }
+        } else if (editingDiary.isPublic && !isPublic) { // 以前は公開だったが、今回非公開にする場合
+            const publicDocId = editingDiary.publicId || await findPublicDocId(editingDiary.id, user.uid);
+            if (publicDocId) {
+                await deleteDoc(doc(db, `artifacts/${appId}/public/data/allLoveRecords`, publicDocId));
+            }
+        }
+
+        showCustomModal('恋録が更新されました！');
+        setEditingDiary(null);
+      } else {
+        // 新しい恋録を追加
+        const myDiariesCollectionRef = collection(db, `artifacts/${appId}/users/${user.uid}/myLoveRecords`);
+        const newDocRef = await addDoc(myDiariesCollectionRef, myDiaryData);
+
+        // 公開に設定されている場合、公開コレクションにも追加
+        if (isPublic) {
+          const publicDiariesCollectionRef = collection(db, `artifacts/${appId}/public/data/allLoveRecords`);
+          await addDoc(publicDiariesCollectionRef, {
+            title: newTitle,
+            content: newContent,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+            authorEmail: user.email,
+            originalUserId: user.uid,
+            originalDiaryId: newDocRef.id // プライベート日記のIDにリンク
+          });
+        }
+        showCustomModal('新しい恋録が追加されました！');
+      }
+      setNewTitle('');
+      setNewContent('');
+      setIsPublic(false); // フォームをリセット
+    } catch (error) {
+      console.error("恋録の保存に失敗しました:", error);
+      showCustomModal(`エラー: 恋録の保存に失敗しました。${error.message}`);
+    }
+  };
+
+  // 公開ドキュメントのIDを検索するヘルパー関数
+  const findPublicDocId = async (originalDiaryId, originalUserId) => {
+    const q = query(collection(db, `artifacts/${appId}/public/data/allLoveRecords`),
+                    where("originalDiaryId", "==", originalDiaryId),
+                    where("originalUserId", "==", originalUserId));
+    const querySnapshot = await getDocs(q);
+    if (!querySnapshot.empty) {
+      return querySnapshot.docs[0].id;
+    }
+    return null;
+  };
+
+  // 恋録の編集モードに入る
+  const handleEditDiary = (diary) => {
+    setEditingDiary(diary);
+    setNewTitle(diary.title);
+    setNewContent(diary.content);
+    setIsPublic(diary.isPublic || false); // 公開ステータスを編集フォームに反映
+    window.scrollTo({ top: 0, behavior: 'smooth' }); // フォームまでスクロール
+  };
+
+  // 恋録の削除確認
+  const handleDeleteDiary = (diaryId, isPublicEntry) => {
+    showCustomModal('この恋録を本当に削除しますか？', () => confirmDeleteDiary(diaryId, isPublicEntry));
+  };
+
+  // 恋録を削除する実際の処理
+  const confirmDeleteDiary = async (diaryId, isPublicEntry) => {
+    if (!db || !user) {
+      showCustomModal('ログインしてください。');
+      return;
+    }
+    try {
+      // プライベートコレクションから削除
+      const myDiaryRef = doc(db, `artifacts/${appId}/users/${user.uid}/myLoveRecords`, diaryId);
+      await deleteDoc(myDiaryRef);
+
+      // 公開されていた場合、公開コレクションからも削除
+      if (isPublicEntry) {
+        const publicDocId = await findPublicDocId(diaryId, user.uid);
+        if (publicDocId) {
+          const publicDiaryRef = doc(db, `artifacts/${appId}/public/data/allLoveRecords`, publicDocId);
+          await deleteDoc(publicDiaryRef);
+        }
+      }
+
+      showCustomModal('恋録が削除されました。');
+    } catch (error) {
+      console.error("恋録の削除に失敗しました:", error);
+      showCustomModal(`エラー: 恋録の削除に失敗しました。${error.message}`);
+    } finally {
+      closeCustomModal();
+    }
+  };
+
+  // ✨ Gemini API連携機能: 恋録の言葉を生成 ✨
+  const generateLoveWords = async (diaryId, title, content) => {
+    setGeneratingWordsForDiaryId(diaryId); // LLM処理中であることを示す
+    setGeneratedWords(''); // 以前の生成結果をクリア
+
+    const prompt = `以下の恋録の内容に基づいて、短く心温まるメッセージや、恋の応援歌のような言葉を生成してください。敬語は使わず、親しみやすいトーンでお願いします。
+
+タイトル: ${title}
+内容: ${content}`;
+
+    try {
+      let chatHistory = [];
+      chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+      const payload = { contents: chatHistory };
+      const apiKey = ""; // Canvasが自動的にAPIキーを提供します
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const result = await response.json();
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        const text = result.candidates[0].content.parts[0].text;
+        setGeneratedWords(text);
+        showCustomModal('✨恋録の言葉✨', null); // 生成された言葉をモーダルで表示
+      } else {
+        console.error("Gemini APIからの応答が予期せぬ構造です:", result);
+        showCustomModal('エラー: 恋録の言葉を生成できませんでした。');
+      }
+    } catch (error) {
+      console.error("Gemini API呼び出しエラー:", error);
+      showCustomModal(`エラー: 恋録の言葉の生成中に問題が発生しました。${error.message}`);
+    } finally {
+      setGeneratingWordsForDiaryId(null); // LLM処理終了
+    }
+  };
+
+
+  // ローディング中の表示
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-white">
+        <div className="text-pink-600 text-2xl font-bold animate-pulse">読み込み中...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-white font-inter text-gray-800 p-4 sm:p-6 lg:p-8">
+      <div className="max-w-4xl mx-auto bg-white rounded-3xl shadow-xl p-6 sm:p-8 lg:p-10">
+        <h1 className="text-4xl sm:text-5xl font-extrabold text-center text-pink-600 mb-6 tracking-tight">
+          恋録
+        </h1>
+
+        {!user ? (
+          // --- 認証フォーム ---
+          <div className="p-6 bg-pink-50 rounded-2xl shadow-inner max-w-md mx-auto">
+            <h2 className="text-2xl font-bold text-pink-700 mb-6 text-center">アカウント</h2>
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div>
+                <label htmlFor="email" className="block text-gray-700 text-sm font-semibold mb-1">
+                  メールアドレス
+                </label>
+                <input
+                  type="email"
+                  id="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="your.email@example.com"
+                  className="w-full p-2 text-sm border border-pink-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-300"
+                  required
+                />
+              </div>
+              <div>
+                <label htmlFor="password" className="block text-gray-700 text-sm font-semibold mb-1">
+                  パスワード
+                </label>
+                <input
+                  type="password"
+                  id="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="パスワード"
+                  className="w-full p-2 text-sm border border-pink-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-300"
+                  required
+                />
+              </div>
+              {authError && <p className="text-red-500 text-xs text-center">{authError}</p>}
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  type="submit"
+                  className="flex-1 bg-pink-500 hover:bg-pink-600 text-white font-bold py-2 px-4 rounded-xl shadow-md transition duration-300 ease-in-out hover:scale-105 text-sm"
+                >
+                  ログイン
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRegister}
+                  className="flex-1 bg-pink-400 hover:bg-pink-500 text-white font-bold py-2 px-4 rounded-xl shadow-md transition duration-300 ease-in-out hover:scale-105 text-sm"
+                >
+                  新規登録
+                </button>
+              </div>
+            </form>
+          </div>
+        ) : (
+          // --- メインアプリコンテンツ (ログイン後) ---
+          <>
+            <p className="text-center text-gray-700 mb-6 text-xs sm:text-sm">
+              ログイン中: <span className="font-mono bg-pink-50 px-2 py-1 rounded-md text-pink-700 break-all">{user.email}</span>
+              <br />
+              あなたのユーザーID: <span className="font-mono bg-pink-50 px-2 py-1 rounded-md text-pink-700 break-all">{user.uid}</span>
+            </p>
+            <button
+              onClick={handleLogout}
+              className="block mx-auto mb-8 bg-pink-100 hover:bg-pink-200 text-pink-700 font-bold py-2 px-4 rounded-xl shadow-md transition duration-300 ease-in-out hover:scale-105 text-sm"
+            >
+              ログアウト
+            </button>
+
+            {/* タブナビゲーション */}
+            <div className="flex justify-center mb-8 bg-pink-100 rounded-full p-1 shadow-inner">
+              <button
+                onClick={() => setActiveTab('myRecords')}
+                className={`flex-1 py-3 px-6 rounded-full font-semibold transition duration-300 ease-in-out text-sm ${
+                  activeTab === 'myRecords'
+                    ? 'bg-pink-500 text-white shadow-md'
+                    : 'text-pink-700 hover:bg-pink-200'
+                }`}
+              >
+                自分の恋録
+              </button>
+              <button
+                onClick={() => setActiveTab('allRecords')}
+                className={`flex-1 py-3 px-6 rounded-full font-semibold transition duration-300 ease-in-out text-sm ${
+                  activeTab === 'allRecords'
+                    ? 'bg-pink-500 text-white shadow-md'
+                    : 'text-pink-700 hover:bg-pink-200'
+                }`}
+              >
+                みんなの恋録
+              </button>
+            </div>
+
+            {activeTab === 'myRecords' && (
+              <>
+                {/* 自分の恋録入力フォーム */}
+                <form onSubmit={handleSubmitDiary} className="mb-10 p-6 bg-pink-50 rounded-2xl shadow-inner">
+                  <h2 className="text-2xl font-bold text-pink-700 mb-6 text-center">
+                    {editingDiary ? '恋録を編集する' : '新しい恋録を書く'}
+                  </h2>
+                  <div className="mb-4">
+                    <label htmlFor="title" className="block text-gray-700 text-sm font-semibold mb-1">
+                      タイトル
+                    </label>
+                    <input
+                      type="text"
+                      id="title"
+                      value={newTitle}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      placeholder="今日の恋のタイトル"
+                      className="w-full p-2 text-sm border border-pink-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-300"
+                      required
+                    />
+                  </div>
+                  <div className="mb-4">
+                    <label htmlFor="content" className="block text-gray-700 text-sm font-semibold mb-1">
+                      内容
+                    </label>
+                    <textarea
+                      id="content"
+                      value={newContent}
+                      onChange={(e) => setNewContent(e.target.value)}
+                      placeholder="今日の恋の出来事を詳しく書きましょう..."
+                      rows="5"
+                      className="w-full p-2 text-sm border border-pink-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-300 resize-y"
+                      required
+                    ></textarea>
+                  </div>
+                  <div className="mb-6 flex items-center">
+                    <input
+                      type="checkbox"
+                      id="isPublic"
+                      checked={isPublic}
+                      onChange={(e) => setIsPublic(e.target.checked)}
+                      className="h-4 w-4 text-pink-600 rounded focus:ring-pink-500 border-gray-300"
+                    />
+                    <label htmlFor="isPublic" className="ml-2 text-gray-700 text-sm">
+                      みんなに公開する
+                    </label>
+                  </div>
+                  <button
+                    type="submit"
+                    className="w-full bg-pink-500 hover:bg-pink-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transform transition duration-300 ease-in-out hover:scale-105 text-sm"
+                  >
+                    {editingDiary ? '恋録を更新する' : '恋録を追加する'}
+                  </button>
+                  {editingDiary && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingDiary(null);
+                        setNewTitle('');
+                        setNewContent('');
+                        setIsPublic(false);
+                      }}
+                      className="mt-3 w-full bg-pink-100 hover:bg-pink-200 text-pink-700 font-bold py-2 px-4 rounded-xl shadow-lg transform transition duration-300 ease-in-out hover:scale-105 text-sm"
+                    >
+                      キャンセル
+                    </button>
+                  )}
+                </form>
+
+                {/* 自分の恋録一覧 */}
+                <h2 className="text-2xl font-bold text-pink-600 mb-6 text-center">自分の恋録を振り返る</h2>
+                {myDiaries.length === 0 ? (
+                  <p className="text-center text-gray-500 text-sm">まだ恋録がありません。最初の恋録を書いてみましょう！</p>
+                ) : (
+                  <div className="grid gap-4 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-2">
+                    {myDiaries.map((diary) => (
+                      <div key={diary.id} className="bg-white p-4 rounded-xl shadow-md border border-pink-100 flex flex-col justify-between text-sm">
+                        <div>
+                          <h3 className="text-lg font-semibold text-pink-700 mb-1">{diary.title}</h3>
+                          <p className="text-gray-600 text-xs mb-2">
+                            {diary.createdAt?.toDate().toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric' })}
+                            {diary.isPublic && <span className="ml-2 px-2 py-0.5 bg-pink-100 text-pink-600 rounded-full text-xs">公開中</span>}
+                          </p>
+                          <p className="text-gray-700 mb-3 whitespace-pre-wrap text-xs">{diary.content}</p>
+                        </div>
+                        <div className="flex flex-col space-y-2 mt-2">
+                          <button
+                            onClick={() => generateLoveWords(diary.id, diary.title, diary.content)}
+                            className="w-full bg-pink-300 hover:bg-pink-400 text-white font-bold py-1.5 px-3 rounded-lg shadow-md transition duration-300 ease-in-out hover:scale-105 text-xs flex items-center justify-center"
+                            disabled={generatingWordsForDiaryId === diary.id}
+                          >
+                            {generatingWordsForDiaryId === diary.id ? (
+                              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                            ) : (
+                              '恋録の言葉'
+                            )}
+                          </button>
+                          <div className="flex justify-end space-x-2">
+                            <button
+                              onClick={() => handleEditDiary(diary)}
+                              className="bg-pink-200 hover:bg-pink-300 text-pink-700 font-bold py-1.5 px-3 rounded-lg shadow-md transition duration-300 ease-in-out hover:scale-105 text-xs"
+                            >
+                              編集
+                            </button>
+                            <button
+                              onClick={() => handleDeleteDiary(diary.id, diary.isPublic)}
+                              className="bg-red-300 hover:bg-red-400 text-white font-bold py-1.5 px-3 rounded-lg shadow-md transition duration-300 ease-in-out hover:scale-105 text-xs"
+                            >
+                              削除
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {activeTab === 'allRecords' && (
+              <>
+                {/* みんなの恋録一覧 */}
+                <h2 className="text-2xl font-bold text-pink-600 mb-6 text-center">みんなの恋録</h2>
+                {allDiaries.length === 0 ? (
+                  <p className="text-center text-gray-500 text-sm">まだ公開された恋録がありません。</p>
+                ) : (
+                  <div className="grid gap-4 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-2">
+                    {allDiaries.map((diary) => (
+                      <div key={diary.id} className="bg-white p-4 rounded-xl shadow-md border border-pink-100 text-sm">
+                        <h3 className="text-lg font-semibold text-pink-700 mb-1">{diary.title}</h3>
+                        <p className="text-gray-600 text-xs mb-2">
+                          {diary.createdAt?.toDate().toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric' })}
+                          {' by '}
+                          <span className="font-medium text-pink-500">{diary.authorEmail || '匿名ユーザー'}</span>
+                        </p>
+                        <p className="text-gray-700 whitespace-pre-wrap text-xs">{diary.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* カスタムモーダル */}
+      {showModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl p-8 shadow-2xl max-w-sm w-full text-center">
+            {generatedWords ? (
+              <>
+                <h3 className="text-xl font-bold text-pink-700 mb-4">恋録の言葉</h3>
+                <p className="text-gray-800 text-base mb-6 whitespace-pre-wrap">{generatedWords}</p>
+                <button
+                  onClick={closeCustomModal}
+                  className="bg-pink-500 hover:bg-pink-600 text-white font-bold py-2 px-5 rounded-lg transition duration-300 ease-in-out text-sm"
+                >
+                  閉じる
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-gray-800 text-lg mb-6">{modalMessage}</p>
+                <div className="flex justify-center space-x-4">
+                  {modalAction ? (
+                    <>
+                      <button
+                        onClick={() => {
+                          modalAction();
+                          closeCustomModal();
+                        }}
+                        className="bg-red-400 hover:bg-red-500 text-white font-bold py-2 px-5 rounded-lg transition duration-300 ease-in-out text-sm"
+                      >
+                        はい
+                      </button>
+                      <button
+                        onClick={closeCustomModal}
+                        className="bg-pink-100 hover:bg-pink-200 text-pink-700 font-bold py-2 px-5 rounded-lg transition duration-300 ease-in-out text-sm"
+                      >
+                        いいえ
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={closeCustomModal}
+                      className="bg-pink-500 hover:bg-pink-600 text-white font-bold py-2 px-5 rounded-lg transition duration-300 ease-in-out text-sm"
+                    >
+                      OK
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
